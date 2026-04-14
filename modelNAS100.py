@@ -252,7 +252,7 @@ def main():
     criterion_profit = nn.SmoothL1Loss()
     criterion_tipo   = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     optimizer        = optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4)
-    scheduler        = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=False)
+    scheduler        = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     early_stopping   = EarlyStopping(patience=30)
     best_path        = os.path.join(MODEL_DIR, "best_trading_model_NAS100_v4.pth")
 

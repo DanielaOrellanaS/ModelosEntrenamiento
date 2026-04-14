@@ -2,6 +2,14 @@
 API Unificada — NAS100 + US30 + GER40 + BTCUSD + AUDUSD + GBPAUD + EURUSD + GBPUSD
 Inicio: uvicorn apiDataset:app --host 192.168.100.73 --port 80 --reload
 
+CAMBIOS v6:
+  - min_threshold diferenciado: índices=0.92, forex=0.50
+    (AUDUSD/GBPAUD/EURUSD/GBPUSD nunca alcanzan 0.92 por naturaleza del activo)
+  - Cache de velas corregido: ahora guarda por clave completa sym+vela
+    en lugar de solo por símbolo, evitando que peticiones históricas
+    devuelvan el resultado de la última vela procesada
+  - valor_profit en pips para forex (÷ pips_factor antes de responder)
+    para que el EA reciba el mismo orden de magnitud que los índices
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -19,8 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests as http_requests
+from collections import OrderedDict
 
-API_VERSION   = "v5"
+API_VERSION   = "v6"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +37,11 @@ DATA_DIR  = os.path.join(BASE_DIR, "DataFiles")
 CACHE_DIR = os.path.join(BASE_DIR, "Trading_Modelv4")
 
 # ── Configuración de modelos ──────────────────────────────────
+# CLAVE: min_threshold separado para índices (0.92) y forex (0.50)
+# Los modelos forex generan confianzas más bajas por la naturaleza del
+# precio (movimientos pequeños, alta incertidumbre relativa).
+# 0.50 deja que el umbral dinámico calculado en training sea el que mande.
+
 MODELOS_CONFIG = {
     "NAS100": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
@@ -35,7 +49,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_NAS100_v4.pkl",
         "cols_file":     "input_columns_NAS100_v4.pkl",
         "data_file":     "Data_Entrenamiento_NAS100.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.92,   # índice — alta confianza requerida
     },
     "US30": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
@@ -61,13 +75,17 @@ MODELOS_CONFIG = {
         "data_file":     "Data_Entrenamiento_BTCUSD.xlsx",
         "min_threshold": 0.92,
     },
+    # ── FOREX: min_threshold = 0.50 ──────────────────────────────
+    # Deja que el umbral óptimo calculado en entrenamiento sea el que
+    # decida. Si el mejor umbral fue 0.62, la API usará 0.62.
+    # Con 0.92 TODOS los forex salían IGNORE siempre.
     "AUDUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_AUDUSD_v4.pth",
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.50,
     },
     "GBPAUD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
@@ -75,7 +93,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_GBPAUD_v4.pkl",
         "cols_file":     "input_columns_GBPAUD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPAUD.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.50,
     },
     "EURUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
@@ -83,7 +101,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_EURUSD_v4.pkl",
         "cols_file":     "input_columns_EURUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_EURUSD.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.50,
     },
     "GBPUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
@@ -91,9 +109,29 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.50,
     },
 }
+
+# ── Cache de resultados por vela ──────────────────────────────
+# Clave: "SYM_YYYYMMDDHHSS" — única por símbolo+vela
+# Capacidad máxima: 200 entradas (LRU)
+# Antes se usaba solo sym como clave → peticiones de velas distintas
+# devolvían el resultado de la última vela procesada.
+CACHE_VELAS: OrderedDict = OrderedDict()
+CACHE_MAX = 200
+
+def cache_get(clave):
+    if clave in CACHE_VELAS:
+        CACHE_VELAS.move_to_end(clave)
+        return CACHE_VELAS[clave]
+    return None
+
+def cache_set(clave, valor):
+    CACHE_VELAS[clave] = valor
+    CACHE_VELAS.move_to_end(clave)
+    if len(CACHE_VELAS) > CACHE_MAX:
+        CACHE_VELAS.popitem(last=False)
 
 # ── Arquitectura del modelo ───────────────────────────────────
 
@@ -144,8 +182,6 @@ def denorm_scalar(value, min_val, max_val):
 
 def denorm_array(arr, min_val, max_val):
     return (arr + 1) * (max_val - min_val) / 2 + min_val
-
-# ── Detección automática de tipo por keys del scaler ─────────
 
 def detectar_tipo_modelo(SC):
     return "standard"
@@ -249,24 +285,38 @@ def calcular_umbral_optimo(model, SC, COLS, data_file, model_type, n_samples=10)
     pred_p = denorm_array(np.array(all_pred_p), SC['min_profit'], SC['max_profit'])
     total  = len(conf)
 
-    best_thr, best_pf, best_n = 0.35, 0.0, total
-    for thr in np.arange(0.35, 0.92, 0.01):
+    # FIX: Para forex (pips_factor > 1), los modelos generan confianzas más bajas
+    # por la naturaleza de los movimientos pequeños. Limitamos el umbral máximo
+    # a 0.70 para evitar que queden 0 operaciones en producción.
+    # Para índices mantenemos el rango completo hasta 0.95.
+    pips_factor = SC.get("pips_factor", 1)
+    is_forex    = pips_factor > 1
+    thr_max     = 0.70 if is_forex else 0.95
+
+    # FIX: Además de maximizar PF, penalizamos umbrales que dejan muy pocas ops.
+    # score = PF * log(n_ops) — balanceo entre calidad y cobertura.
+    # Esto evita que un umbral de 0.87 con 3 ops ganadoras "gane" sobre
+    # un umbral de 0.52 con 150 ops y PF=1.4.
+    best_thr, best_score, best_pf, best_n = 0.35, 0.0, 0.0, total
+    for thr in np.arange(0.35, thr_max + 0.01, 0.01):
         mask  = conf > thr
         n_ops = mask.sum()
-        if n_ops < total * 0.10: break
+        if n_ops < total * 0.05: break   # mínimo 5% de operaciones
         fr = real_p[mask]
         winners, losers = fr[fr > 0], fr[fr < 0]
         if len(losers) == 0 or len(winners) == 0: continue
-        pf = abs(winners.sum() / losers.sum())
-        if pf > best_pf:
-            best_pf, best_thr, best_n = pf, round(float(thr), 2), int(n_ops)
+        pf    = abs(winners.sum() / losers.sum())
+        score = pf * np.log(n_ops + 1)  # penaliza umbrales con pocas ops
+        if score > best_score:
+            best_score, best_pf, best_thr, best_n = score, pf, round(float(thr), 2), int(n_ops)
 
     p_inf = round(float(np.percentile(pred_p, 10)), 6)
     p_sup = round(float(np.percentile(pred_p, 90)), 6)
-    print(f"  Umbral: {best_thr:.2f}  →  {best_n} ops ({best_n/total*100:.1f}%)  |  PF: {best_pf:.2f}  |  P10: {p_inf:.2f}  P90: {p_sup:.2f}")
+    tipo_activo = "FOREX" if is_forex else "ÍNDICE"
+    print(f"  [{tipo_activo}] Umbral óptimo: {best_thr:.2f}  →  {best_n} ops ({best_n/total*100:.1f}%)  |  PF: {best_pf:.2f}  |  P10: {p_inf:.4f}  P90: {p_sup:.4f}")
     return best_thr, best_pf, best_n, total, p_inf, p_sup
 
-# ── Carga de un modelo individual (se ejecuta en paralelo) ───
+# ── Carga de un modelo individual ────────────────────────────
 
 def cargar_modelo(symbol, cfg):
     print(f"[{symbol}] Cargando...")
@@ -277,7 +327,8 @@ def cargar_modelo(symbol, cfg):
         with open(os.path.join(cfg["model_dir"], cfg["cols_file"]),   "rb") as f: COLS = pickle.load(f)
 
         mt = detectar_tipo_modelo(SC)
-        print(f"  [{symbol}] Tipo: {mt}")
+        pips = SC.get("pips_factor", 1)
+        print(f"  [{symbol}] Tipo: {mt}  |  pips_factor: {pips}")
 
         model = TradingModelV4(input_size=len(COLS), dropout=0.4)
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
@@ -297,28 +348,33 @@ def cargar_modelo(symbol, cfg):
             _save_threshold_cache(symbol, model_path, thr, pf, n, total, p_inf, p_sup)
 
         min_thr = cfg.get("min_threshold", 0.35)
-        thr = max(thr, min_thr)
-        if thr == min_thr:
-            print(f"  [{symbol}] Umbral ajustado al mínimo: {thr:.2f}")
+        thr_final = max(thr, min_thr)
+        if thr_final == min_thr and thr < min_thr:
+            print(f"  [{symbol}] Umbral óptimo {thr:.2f} < mínimo {min_thr:.2f} → usando {thr_final:.2f}")
+        else:
+            print(f"  [{symbol}] Umbral final: {thr_final:.2f}")
 
         print(f"  [{symbol}] Listo ✓")
         return symbol, {
             "model":      model,
             "SC":         SC,
             "COLS":       COLS,
-            "threshold":  thr,
+            "threshold":  thr_final,
             "pf":         pf,
             "n_ops":      n,
             "total":      total,
             "p_inf":      p_inf,
             "p_sup":      p_sup,
             "model_type": mt,
+            "pips_factor": pips,
         }
     except Exception as e:
+        import traceback
         print(f"  [{symbol}] ERROR: {e}")
+        traceback.print_exc()
         return symbol, None
 
-# ── Cargar todos los modelos en paralelo al arrancar ─────────
+# ── Cargar todos los modelos en paralelo ─────────────────────
 
 MODELOS = {}
 
@@ -376,11 +432,23 @@ def predict(
     MODEL     = m["model"]
     COLS      = m["COLS"]
     THRESHOLD = m["threshold"]
+    PIPS      = m["pips_factor"]
 
     try:
         dt = datetime.fromisoformat(fecha)
     except ValueError:
         raise HTTPException(400, f"Fecha invalida: '{fecha}'. Formato esperado: 2026-01-19T01:15:48")
+
+    # ── Cache por clave sym+vela ──────────────────────────────
+    # Corrige el bug anterior donde sym solo como clave hacía que
+    # peticiones de velas históricas devolvieran la última vela procesada.
+    minuto_vela = dt.replace(second=0, microsecond=0)
+    minuto_vela = minuto_vela.replace(minute=(dt.minute // 5) * 5)
+    clave_vela  = f"{sym}_{minuto_vela.strftime('%Y%m%d%H%M')}"
+
+    cached = cache_get(clave_vela)
+    if cached:
+        return JSONResponse(cached)
 
     # ── FIX: corrección automática de h/l swapped desde el EA ────
     h5_fixed, l5_fixed = h5, l5
@@ -397,7 +465,7 @@ def predict(
     h5, l5   = h5_fixed, l5_fixed
     h15, l15 = h15_fixed, l15_fixed
 
-    # ── Construir features ────────────────────────────────────────
+    # ── Construir features ────────────────────────────────────
     e550v   = ema550       if ema550       is not None else 0.0
     e5200v  = ema5200      if ema5200      is not None else 0.0
     e50pv   = ema50_prev   if ema50_prev   is not None else 0.0
@@ -443,15 +511,26 @@ def predict(
     confidence = float(confidence.item())
     class_idx  = int(tipo_probs.argmax(dim=1).item())
     signal     = "BUY" if class_idx == 1 else "SELL"
-    profit_est = denorm_scalar(pred_profit.item(), s["min_profit"], s["max_profit"])
-    valid      = confidence >= THRESHOLD
 
-    return JSONResponse({
+    # profit_est está en pips si PIPS > 1 (forex), en puntos si PIPS = 1 (índices)
+    profit_est_raw = denorm_scalar(pred_profit.item(), s["min_profit"], s["max_profit"])
+    # Para forex: devolver en pips (dividir por pips_factor) para que sea comparable
+    # Para índices: PIPS=1, no hay cambio
+    profit_est = profit_est_raw / PIPS if PIPS > 1 else profit_est_raw
+
+    valid = confidence >= THRESHOLD
+
+    resultado = {
         "valor_profit":  round(profit_est, 6),
         "RESULTADO":     signal if valid else "IGNORE",
         "percentil_inf": m["p_inf"],
         "percentil_sup": m["p_sup"],
-    })
+        "confidence":    round(confidence, 4),   # útil para debug
+        "threshold":     round(THRESHOLD, 4),    # útil para debug
+    }
+
+    cache_set(clave_vela, resultado)
+    return JSONResponse(resultado)
 
 @app.get("/health")
 def health():
@@ -459,14 +538,16 @@ def health():
         "status":       "ok",
         "api_version":  API_VERSION,
         "startup_time": STARTUP_TIME,
+        "cache_size":   len(CACHE_VELAS),
         "modelos": {
             sym: {
-                "threshold":  m["threshold"],
-                "pf":         round(m["pf"], 2),
-                "ops":        f"{m['n_ops']}/{m['total']}",
-                "p_inf":      m["p_inf"],
-                "p_sup":      m["p_sup"],
-                "model_type": m["model_type"],
+                "threshold":   m["threshold"],
+                "pf":          round(m["pf"], 2),
+                "ops":         f"{m['n_ops']}/{m['total']}",
+                "p_inf":       m["p_inf"],
+                "p_sup":       m["p_sup"],
+                "model_type":  m["model_type"],
+                "pips_factor": m["pips_factor"],
             }
             for sym, m in MODELOS.items()
         }

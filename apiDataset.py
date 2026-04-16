@@ -28,8 +28,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests as http_requests
 from collections import OrderedDict
+import threading
 
-API_VERSION   = "v6"
+API_VERSION   = "v6.2"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -119,7 +120,7 @@ MODELOS_CONFIG = {
 # Antes se usaba solo sym como clave → peticiones de velas distintas
 # devolvían el resultado de la última vela procesada.
 CACHE_VELAS: OrderedDict = OrderedDict()
-CACHE_MAX = 200
+CACHE_MAX = 500  # más entradas para no perder velas históricas
 
 def cache_get(clave):
     if clave in CACHE_VELAS:
@@ -132,6 +133,49 @@ def cache_set(clave, valor):
     CACHE_VELAS.move_to_end(clave)
     if len(CACHE_VELAS) > CACHE_MAX:
         CACHE_VELAS.popitem(last=False)
+
+# ── Sistema de log para diagnóstico forex ─────────────────────
+# Registra cada predicción forex en AnalisisForex.jsonl
+# Una línea JSON por predicción → fácil de leer y analizar
+FOREX_SYMS   = {"AUDUSD", "GBPAUD", "EURUSD", "GBPUSD"}
+LOG_PATH     = os.path.join(BASE_DIR, "AnalisisForex.jsonl")
+_log_lock    = threading.Lock()
+
+def log_forex(sym, fecha_str, o5, h5, l5, c5, v5,
+              r5, m5, s5,
+              ema550, ema5200, adx5, diPlus5, diMinus5,
+              macdLine5, signalLine5,
+              confidence, threshold, signal, resultado_final,
+              profit_est):
+    """Escribe una línea JSON en AnalisisForex.jsonl por cada predicción forex."""
+    entry = {
+        "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sym":        sym,
+        "fecha":      fecha_str,
+        # precios raw
+        "o5": round(o5, 6), "h5": round(h5, 6),
+        "l5": round(l5, 6), "c5": round(c5, 6), "v5": round(v5, 2),
+        # indicadores raw
+        "rsi5": round(r5, 2), "stoch_main": round(m5, 2), "stoch_sign": round(s5, 2),
+        "ema550":  round(ema550,  6) if ema550  is not None else None,
+        "ema5200": round(ema5200, 6) if ema5200 is not None else None,
+        "adx5":    round(adx5,   2) if adx5    is not None else None,
+        "diPlus5": round(diPlus5,2) if diPlus5 is not None else None,
+        "diMinus5":round(diMinus5,2) if diMinus5 is not None else None,
+        "macdLine5":   round(macdLine5,  6) if macdLine5   is not None else None,
+        "signalLine5": round(signalLine5,6) if signalLine5 is not None else None,
+        # resultado del modelo
+        "confidence":      round(confidence, 4),
+        "threshold":       round(threshold, 4),
+        "gap_vs_threshold":round(confidence - threshold, 4),  # negativo = no alcanzó
+        "supera_umbral":   confidence >= threshold,
+        "signal_modelo":   signal,        # lo que el modelo dice (BUY/SELL)
+        "resultado_final": resultado_final,  # lo que la API devuelve (puede ser IGNORE)
+        "profit_est":      round(profit_est, 6),
+    }
+    with _log_lock:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
 
 # ── Arquitectura del modelo ───────────────────────────────────
 
@@ -439,12 +483,14 @@ def predict(
     except ValueError:
         raise HTTPException(400, f"Fecha invalida: '{fecha}'. Formato esperado: 2026-01-19T01:15:48")
 
-    # ── Cache por clave sym+vela ──────────────────────────────
-    # Corrige el bug anterior donde sym solo como clave hacía que
-    # peticiones de velas históricas devolvieran la última vela procesada.
-    minuto_vela = dt.replace(second=0, microsecond=0)
-    minuto_vela = minuto_vela.replace(minute=(dt.minute // 5) * 5)
-    clave_vela  = f"{sym}_{minuto_vela.strftime('%Y%m%d%H%M')}"
+    # ── Cache por clave sym + fecha exacta + OHLC completo ───────
+    # Usamos la fecha exacta (sin redondear a vela de 5m) + OHLC completo.
+    # Esto evita dos problemas:
+    #   1. El EA manda datos de velas pasadas con la fecha de la vela actual
+    #      → cada combinación fecha+precios es única y se calcula por separado.
+    #   2. Si se consulta una vela pasada (ej: 09:00 después de que ya pasó 09:05),
+    #      el resultado queda en cache y siempre devuelve el mismo valor correcto.
+    clave_vela = f"{sym}_{dt.strftime('%Y%m%d%H%M%S')}_{o5:.5f}_{h5:.5f}_{l5:.5f}_{c5:.5f}"
 
     cached = cache_get(clave_vela)
     if cached:
@@ -529,8 +575,112 @@ def predict(
         "threshold":     round(THRESHOLD, 4),    # útil para debug
     }
 
+    # ── Log de diagnóstico para forex ────────────────────────────
+    # Solo registra AUDUSD, GBPAUD, EURUSD, GBPUSD
+    # El archivo AnalisisForex.jsonl se crea junto a la API
+    if sym in FOREX_SYMS:
+        log_forex(
+            sym=sym, fecha_str=fecha,
+            o5=o5, h5=h5, l5=l5, c5=c5, v5=v5,
+            r5=r5, m5=m5, s5=s5,
+            ema550=ema550, ema5200=ema5200,
+            adx5=adx5, diPlus5=diPlus5, diMinus5=diMinus5,
+            macdLine5=macdLine5, signalLine5=signalLine5,
+            confidence=confidence, threshold=THRESHOLD,
+            signal=signal, resultado_final=resultado["RESULTADO"],
+            profit_est=profit_est,
+        )
+
     cache_set(clave_vela, resultado)
     return JSONResponse(resultado)
+
+@app.get("/analisis_forex")
+def analisis_forex(symbol: str = Query(None), ultimas: int = Query(200)):
+    """
+    Devuelve un resumen del log forex para diagnóstico.
+    Parámetros:
+      symbol  — filtrar por par (AUDUSD, GBPAUD, EURUSD, GBPUSD). Opcional.
+      ultimas — cuántas entradas recientes analizar (default 200).
+    """
+    if not os.path.exists(LOG_PATH):
+        return {"error": "Aún no hay datos. El archivo se crea cuando llega la primera petición forex."}
+
+    entries = []
+    with open(LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+
+    if symbol:
+        entries = [e for e in entries if e.get("sym","").upper() == symbol.upper()]
+
+    entries = entries[-ultimas:]  # solo las últimas N
+
+    if not entries:
+        return {"error": f"Sin datos para {'symbol='+symbol if symbol else 'forex'}"}
+
+    confs      = [e["confidence"]       for e in entries]
+    gaps       = [e["gap_vs_threshold"] for e in entries]
+    superan    = [e for e in entries if e["supera_umbral"]]
+    no_superan = [e for e in entries if not e["supera_umbral"]]
+    buys       = [e for e in superan if e["signal_modelo"] == "BUY"]
+    sells      = [e for e in superan if e["signal_modelo"] == "SELL"]
+
+    # Distribución de confianza en rangos
+    rangos = {"<0.40": 0, "0.40-0.50": 0, "0.50-0.60": 0,
+              "0.60-0.70": 0, "0.70-0.80": 0, ">0.80": 0}
+    for c in confs:
+        if   c < 0.40: rangos["<0.40"] += 1
+        elif c < 0.50: rangos["0.40-0.50"] += 1
+        elif c < 0.60: rangos["0.50-0.60"] += 1
+        elif c < 0.70: rangos["0.60-0.70"] += 1
+        elif c < 0.80: rangos["0.70-0.80"] += 1
+        else:          rangos[">0.80"] += 1
+
+    n = len(entries)
+    threshold_usado = entries[-1]["threshold"] if entries else None
+
+    return {
+        "symbol_filtrado": symbol or "TODOS_FOREX",
+        "total_entradas_analizadas": n,
+        "threshold_actual": threshold_usado,
+        "resumen_confianza": {
+            "minima":  round(min(confs), 4),
+            "maxima":  round(max(confs), 4),
+            "promedio":round(sum(confs)/n, 4),
+            "P25":     round(sorted(confs)[int(n*0.25)], 4),
+            "P50":     round(sorted(confs)[int(n*0.50)], 4),
+            "P75":     round(sorted(confs)[int(n*0.75)], 4),
+            "P90":     round(sorted(confs)[int(n*0.90)], 4),
+        },
+        "distribucion_confianza": rangos,
+        "señales": {
+            "total_superan_umbral":    len(superan),
+            "total_no_superan_umbral": len(no_superan),
+            "pct_señales":             round(len(superan)/n*100, 1),
+            "BUY":                     len(buys),
+            "SELL":                    len(sells),
+        },
+        "gap_promedio_vs_threshold": round(sum(gaps)/n, 4),
+        "diagnosis": (
+            "✅ El modelo genera señales normalmente."
+            if len(superan)/n > 0.10
+            else f"⚠️  Solo {round(len(superan)/n*100,1)}% de peticiones superan el umbral ({threshold_usado}). "
+                 f"La confianza máxima registrada es {round(max(confs),4)}. "
+                 + ("El threshold está muy alto para este par — reducir min_threshold."
+                    if threshold_usado and max(confs) < threshold_usado
+                    else "El modelo tiene baja confianza general — revisar calidad del entrenamiento.")
+        ),
+        "ultimas_10_entradas": [
+            {k: e[k] for k in ["ts","sym","fecha","confidence","threshold",
+                                "gap_vs_threshold","supera_umbral","resultado_final"]}
+            for e in entries[-10:]
+        ],
+    }
 
 @app.get("/health")
 def health():

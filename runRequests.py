@@ -21,7 +21,7 @@ TEST_DIR   = os.path.join(BASE_DIR, "TestRequests")
 # LOCAL_BASE = "http://10.19.15.69:80" 
 LOCAL_BASE = "http://192.168.100.73:80"
 # LOCAL_BASE = "http://127.0.0.1:80"
-SYMBOL     = "BTCUSD"
+SYMBOL     = "NAS100"
 
 TIMEOUT                  = 5    # segundos por petición
 MAX_ERRORES_CONSECUTIVOS = 3    # para inmediatamente si hay N errores seguidos

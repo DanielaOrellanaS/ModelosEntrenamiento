@@ -18,10 +18,10 @@ from openpyxl.utils import get_column_letter
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 TEST_DIR   = os.path.join(BASE_DIR, "TestRequests")
-# LOCAL_BASE = "http://10.19.15.69:80" 
-LOCAL_BASE = "http://192.168.100.73:80"
+LOCAL_BASE = "http://192.168.0.119" 
+# LOCAL_BASE = "http://192.168.100.73:80"
 # LOCAL_BASE = "http://127.0.0.1:80"
-SYMBOL     = "NAS100"
+SYMBOL     = "GBPAUD"
 
 TIMEOUT                  = 5    # segundos por petición
 MAX_ERRORES_CONSECUTIVOS = 3    # para inmediatamente si hay N errores seguidos

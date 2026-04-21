@@ -1,7 +1,6 @@
 """
 API Unificada — NAS100 + US30 + GER40 + BTCUSD + AUDUSD + GBPAUD + EURUSD + GBPUSD
 Inicio: uvicorn apiDataset:app --host 192.168.100.73 --port 80 --reload
-
 CAMBIOS v6:
   - min_threshold diferenciado: índices=0.92, forex=0.50
     (AUDUSD/GBPAUD/EURUSD/GBPUSD nunca alcanzan 0.92 por naturaleza del activo)
@@ -30,7 +29,7 @@ import requests as http_requests
 from collections import OrderedDict
 import threading
 
-API_VERSION   = "v6.2"
+API_VERSION   = "v6.3"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -76,41 +75,47 @@ MODELOS_CONFIG = {
         "data_file":     "Data_Entrenamiento_BTCUSD.xlsx",
         "min_threshold": 0.92,
     },
-    # ── FOREX: min_threshold = 0.50 ──────────────────────────────
-    # Deja que el umbral óptimo calculado en entrenamiento sea el que
-    # decida. Si el mejor umbral fue 0.62, la API usará 0.62.
-    # Con 0.92 TODOS los forex salían IGNORE siempre.
+    # ── FOREX: thresholds basados en análisis real de AnalisisForex.jsonl ────
+    # AUDUSD:  mediana conf=0.72, 98.9% superaban 0.50 → subir a 0.80
+    #          A 0.80: 20.7% dan señal. Sigue siendo todo SELL por sesgo del
+    #          modelo — se requiere reentrenamiento con dataset balanceado.
     "AUDUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_AUDUSD_v4.pth",
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.50,
+        "min_threshold": 0.80,   # era 0.50 → daba señal en 99% de peticiones
     },
+    # GBPAUD:  mediana conf=0.48, casi solo BUY → threshold 0.60 da ~25% señales
+    #          Sigue siendo todo BUY por sesgo del modelo.
     "GBPAUD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPAUD_v4.pth",
         "scaler_file":   "scaler_GBPAUD_v4.pkl",
         "cols_file":     "input_columns_GBPAUD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPAUD.xlsx",
-        "min_threshold": 0.50,
+        "min_threshold": 0.60,   # era 0.69 → daba solo 5.7% señales
     },
+    # EURUSD:  mediana conf=0.48, threshold 0.50 da 33% señales con buen BUY/SELL
+    #          Es el único forex funcionando correctamente. Mantener 0.50.
     "EURUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_EURUSD_v4.pth",
         "scaler_file":   "scaler_EURUSD_v4.pkl",
         "cols_file":     "input_columns_EURUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_EURUSD.xlsx",
-        "min_threshold": 0.50,
+        "min_threshold": 0.50,   # correcto — 33% señales, mix BUY/SELL
     },
+    # GBPUSD:  mediana conf=0.58, 99.8% superaban 0.52 → subir a 0.65
+    #          A 0.65: 22.4% dan señal. Sigue siendo casi todo SELL.
     "GBPUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPUSD_v4.pth",
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.50,
+        "min_threshold": 0.65,   # era 0.52 → daba señal en 99.8% de peticiones
     },
 }
 
@@ -691,13 +696,13 @@ def health():
         "cache_size":   len(CACHE_VELAS),
         "modelos": {
             sym: {
-                "threshold":   m["threshold"],
-                "pf":          round(m["pf"], 2),
+                "threshold":   float(m["threshold"]),
+                "pf":          round(float(m["pf"]), 2),
                 "ops":         f"{m['n_ops']}/{m['total']}",
-                "p_inf":       m["p_inf"],
-                "p_sup":       m["p_sup"],
+                "p_inf":       float(m["p_inf"]),
+                "p_sup":       float(m["p_sup"]),
                 "model_type":  m["model_type"],
-                "pips_factor": m["pips_factor"],
+                "pips_factor": float(m["pips_factor"]),
             }
             for sym, m in MODELOS.items()
         }

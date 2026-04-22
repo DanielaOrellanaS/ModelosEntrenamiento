@@ -153,7 +153,13 @@ def main():
     )
     data = data[data['fecha'].notna()].sort_values('fecha').reset_index(drop=True)
 
-    data['profit'] = data['profit'] * PIPS_FACTOR
+    # CORRECCIÓN CRÍTICA: el profit en el dataset está definido como pr2-pr1
+    # Para SELL: pr2 < pr1 cuando gana → profit negativo aunque la op es ganadora
+    # Corrección: invertir el signo del profit para SELL antes de multiplicar por pips
+    data['profit'] = data.apply(
+        lambda r: r['profit'] * PIPS_FACTOR if r['tipo'] == 'BUY' else -r['profit'] * PIPS_FACTOR,
+        axis=1
+    )
 
     print(f"Operaciones: {len(data):,}  |  {data['fecha'].min().date()} → {data['fecha'].max().date()}")
     print(f"Profit rango: {data['profit'].min():.1f} pips  →  {data['profit'].max():.1f} pips")

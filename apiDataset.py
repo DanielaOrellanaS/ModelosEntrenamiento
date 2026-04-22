@@ -3,6 +3,9 @@ API Unificada — NAS100 + US30 + GER40 + BTCUSD + AUDUSD + GBPAUD + EURUSD + GB
 Inicio: uvicorn apiDataset:app --host 192.168.100.73 --port 80 --reload
 CAMBIOS v6:
   - min_threshold diferenciado: índices=0.92, forex=0.50
+CAMBIOS v6.4:
+  - Cache de velas redondeado a vela de 5m (fix peticiones por segundo del EA)
+  - Thresholds forex recalibrados según confianzas reales post-reentrenamiento
     (AUDUSD/GBPAUD/EURUSD/GBPUSD nunca alcanzan 0.92 por naturaleza del activo)
   - Cache de velas corregido: ahora guarda por clave completa sym+vela
     en lugar de solo por símbolo, evitando que peticiones históricas
@@ -29,7 +32,7 @@ import requests as http_requests
 from collections import OrderedDict
 import threading
 
-API_VERSION   = "v6.3"
+API_VERSION   = "v6.4"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +88,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.80,   # era 0.50 → daba señal en 99% de peticiones
+        "min_threshold": 0.58,   # calibrado: max conf real = 0.69, P90 = 0.65
     },
     # GBPAUD:  mediana conf=0.48, casi solo BUY → threshold 0.60 da ~25% señales
     #          Sigue siendo todo BUY por sesgo del modelo.
@@ -95,7 +98,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_GBPAUD_v4.pkl",
         "cols_file":     "input_columns_GBPAUD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPAUD.xlsx",
-        "min_threshold": 0.60,   # era 0.69 → daba solo 5.7% señales
+        "min_threshold": 0.55,   # calibrado: max conf real = 0.68, P90 = 0.46
     },
     # EURUSD:  mediana conf=0.48, threshold 0.50 da 33% señales con buen BUY/SELL
     #          Es el único forex funcionando correctamente. Mantener 0.50.
@@ -105,7 +108,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_EURUSD_v4.pkl",
         "cols_file":     "input_columns_EURUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_EURUSD.xlsx",
-        "min_threshold": 0.50,   # correcto — 33% señales, mix BUY/SELL
+        "min_threshold": 0.70,   # calibrado: max conf real = 0.84, P90 = 0.47 (picos reales)
     },
     # GBPUSD:  mediana conf=0.58, 99.8% superaban 0.52 → subir a 0.65
     #          A 0.65: 22.4% dan señal. Sigue siendo casi todo SELL.
@@ -115,7 +118,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.65,   # era 0.52 → daba señal en 99.8% de peticiones
+        "min_threshold": 0.52,   # calibrado: max conf real = 0.60, P90 = 0.51
     },
 }
 
@@ -249,7 +252,15 @@ class DS(Dataset):
 
 def normalizar_dataset(df, s, model_type):
     pips = s.get("pips_factor", 1)
-    df['profit_original'] = df['profit'].fillna(0) * pips
+    # Para forex (pips > 1), el profit en el dataset es pr2-pr1.
+    # En SELL: pr2 < pr1 cuando gana → profit_raw negativo aunque es ganadora.
+    # Los modelos de entrenamiento invierten el signo para SELL antes de normalizar.
+    # Aquí hacemos lo mismo para que el umbral se calcule sobre el mismo espacio.
+    profit_raw = df['profit'].fillna(0) * pips
+    if pips > 1 and 'tipo' in df.columns:
+        profit_raw = profit_raw.copy()
+        profit_raw[df['tipo'] == 'SELL'] *= -1
+    df['profit_original'] = profit_raw
     df['profit_norm'] = norm_series(df['profit_original'], s['p1_profit'], s['p99_profit'])
 
     df['volume5'] = norm_series(df['volume5'], s['p1_vol5'], s['p99_vol5'])
@@ -268,6 +279,10 @@ def normalizar_dataset(df, s, model_type):
 def _cache_path(symbol):
     return os.path.join(CACHE_DIR, f"threshold_cache_{symbol}.json")
 
+# Incrementar esta versión cada vez que cambie la lógica de calcular_umbral_optimo
+# o normalizar_dataset, para invalidar caches anteriores automáticamente.
+THRESHOLD_CACHE_VERSION = 2  # v2: inversión de signo SELL en normalizar_dataset
+
 def _load_threshold_cache(symbol, model_path):
     path = _cache_path(symbol)
     if not os.path.exists(path):
@@ -275,6 +290,9 @@ def _load_threshold_cache(symbol, model_path):
     try:
         with open(path) as f:
             data = json.load(f)
+        if data.get("cache_version", 1) != THRESHOLD_CACHE_VERSION:
+            print(f"  [{symbol}] Cache obsoleto (v{data.get('cache_version',1)} → v{THRESHOLD_CACHE_VERSION}) → recalculando")
+            return None
         current_mtime = os.path.getmtime(model_path)
         if abs(data.get("model_mtime", 0) - current_mtime) < 1.0:
             print(f"  [{symbol}] Umbral cargado desde cache: {data['threshold']:.2f}  PF: {data['pf']:.2f}")
@@ -288,6 +306,7 @@ def _save_threshold_cache(symbol, model_path, thr, pf, n, total, p_inf, p_sup):
     try:
         with open(path, "w") as f:
             json.dump({
+                "cache_version": THRESHOLD_CACHE_VERSION,
                 "model_mtime": os.path.getmtime(model_path),
                 "threshold": thr, "pf": pf, "n": n,
                 "total": total, "p_inf": p_inf, "p_sup": p_sup,
@@ -495,7 +514,12 @@ def predict(
     #      → cada combinación fecha+precios es única y se calcula por separado.
     #   2. Si se consulta una vela pasada (ej: 09:00 después de que ya pasó 09:05),
     #      el resultado queda en cache y siempre devuelve el mismo valor correcto.
-    clave_vela = f"{sym}_{dt.strftime('%Y%m%d%H%M%S')}_{o5:.5f}_{h5:.5f}_{l5:.5f}_{c5:.5f}"
+    # ── Cache por clave sym + vela 5m + OHLC ─────────────────────
+    # Redondea la fecha a la vela de 5m para que múltiples peticiones
+    # del EA dentro de la misma vela devuelvan el mismo resultado sin
+    # recalcular. Ej: 16:07:34, 16:07:35, 16:07:36 con mismo OHLC → misma clave.
+    minuto_vela = dt.minute - (dt.minute % 5)
+    clave_vela = f"{sym}_{dt.strftime('%Y%m%d%H')}{minuto_vela:02d}_{o5:.5f}_{c5:.5f}"
 
     cached = cache_get(clave_vela)
     if cached:

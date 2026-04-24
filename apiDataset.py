@@ -32,7 +32,7 @@ import requests as http_requests
 from collections import OrderedDict
 import threading
 
-API_VERSION   = "v6.4"
+API_VERSION   = "v6.5"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -88,7 +88,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.58,   # calibrado: max conf real = 0.69, P90 = 0.65
+        "min_threshold": 0.88,   # AUDUSD: conf promedio real=0.85, P25=0.83 → necesita umbral alto
     },
     # GBPAUD:  mediana conf=0.48, casi solo BUY → threshold 0.60 da ~25% señales
     #          Sigue siendo todo BUY por sesgo del modelo.
@@ -118,7 +118,7 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.52,   # calibrado: max conf real = 0.60, P90 = 0.51
+        "min_threshold": 0.80,   # GBPUSD: sigue sesgado a SELL, threshold alto hasta reentrenamiento
     },
 }
 
@@ -507,19 +507,15 @@ def predict(
     except ValueError:
         raise HTTPException(400, f"Fecha invalida: '{fecha}'. Formato esperado: 2026-01-19T01:15:48")
 
-    # ── Cache por clave sym + fecha exacta + OHLC completo ───────
-    # Usamos la fecha exacta (sin redondear a vela de 5m) + OHLC completo.
-    # Esto evita dos problemas:
-    #   1. El EA manda datos de velas pasadas con la fecha de la vela actual
-    #      → cada combinación fecha+precios es única y se calcula por separado.
-    #   2. Si se consulta una vela pasada (ej: 09:00 después de que ya pasó 09:05),
-    #      el resultado queda en cache y siempre devuelve el mismo valor correcto.
-    # ── Cache por clave sym + vela 5m + OHLC ─────────────────────
-    # Redondea la fecha a la vela de 5m para que múltiples peticiones
-    # del EA dentro de la misma vela devuelvan el mismo resultado sin
-    # recalcular. Ej: 16:07:34, 16:07:35, 16:07:36 con mismo OHLC → misma clave.
+    # ── Cache por clave sym + vela de 5m (sin precios) ───────────
+    # La clave es solo sym + fecha redondeada a la vela de 5m.
+    # NO incluimos precios porque el EA envía precios levemente distintos
+    # en cada tick de la misma vela (el c5 se actualiza cada segundo), lo que
+    # hacía que cada petición calculara de nuevo aunque fuera la misma vela.
+    # Con esta clave: la primera petición calcula y guarda, todas las siguientes
+    # de esa misma vela devuelven el mismo resultado en cache.
     minuto_vela = dt.minute - (dt.minute % 5)
-    clave_vela = f"{sym}_{dt.strftime('%Y%m%d%H')}{minuto_vela:02d}_{o5:.5f}_{c5:.5f}"
+    clave_vela  = f"{sym}_{dt.strftime('%Y%m%d%H')}{minuto_vela:02d}"
 
     cached = cache_get(clave_vela)
     if cached:

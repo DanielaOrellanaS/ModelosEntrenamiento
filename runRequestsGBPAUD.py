@@ -18,7 +18,7 @@ from openpyxl.utils import get_column_letter
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 TEST_DIR   = os.path.join(BASE_DIR, "TestRequests")
-# LOCAL_BASE = "http://10.19.15.69:80" 
+# LOCAL_BASE = "http://10.188.107.96:80" 
 LOCAL_BASE = "http://192.168.100.73:80"
 SYMBOL     = "GBPAUD"
 

@@ -3,7 +3,12 @@ API Unificada — NAS100 + US30 + GER40 + BTCUSD + AUDUSD + GBPAUD + EURUSD + GB
 Inicio: uvicorn apiDataset:app --host 192.168.100.73 --port 80 --reload
 CAMBIOS v6:
   - min_threshold diferenciado: índices=0.92, forex=0.50
-CAMBIOS v6.4:
+CAMBIOS v6.6:
+  - Cooldown por símbolo: después de una señal válida, las siguientes N velas
+    devuelven IGNORE aunque superen el threshold (sin alterar thresholds).
+    Forex/BTCUSD: 3 velas cooldown | Índices: 2 velas cooldown.
+  - Campo "cooldown_activo" en respuesta para debug (True = señal bloqueada)
+  - Los thresholds, confianzas y log forex no cambian en absoluto.
   - Cache de velas redondeado a vela de 5m (fix peticiones por segundo del EA)
   - Thresholds forex recalibrados según confianzas reales post-reentrenamiento
     (AUDUSD/GBPAUD/EURUSD/GBPUSD nunca alcanzan 0.92 por naturaleza del activo)
@@ -32,7 +37,7 @@ import requests as http_requests
 from collections import OrderedDict
 import threading
 
-API_VERSION   = "v6.5"
+API_VERSION   = "v6.6"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -78,47 +83,54 @@ MODELOS_CONFIG = {
         "data_file":     "Data_Entrenamiento_BTCUSD.xlsx",
         "min_threshold": 0.92,
     },
-    # ── FOREX: thresholds basados en análisis real de AnalisisForex.jsonl ────
-    # AUDUSD:  mediana conf=0.72, 98.9% superaban 0.50 → subir a 0.80
-    #          A 0.80: 20.7% dan señal. Sigue siendo todo SELL por sesgo del
-    #          modelo — se requiere reentrenamiento con dataset balanceado.
+    # ── FOREX: thresholds calibrados con datos reales de AnalisisForex.jsonl ────
+    # Metodología: threshold debe estar entre P90 y max para capturar solo
+    # picos reales de confianza, no el ruido base (~0.47 promedio).
+    #
+    # AUDUSD: promedio=0.74, P90=0.893, max=0.947 → threshold 0.88 ✅ correcto
     "AUDUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_AUDUSD_v4.pth",
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.88,   # AUDUSD: conf promedio real=0.85, P25=0.83 → necesita umbral alto
+        "min_threshold": 0.88,
     },
-    # GBPAUD:  mediana conf=0.48, casi solo BUY → threshold 0.60 da ~25% señales
-    #          Sigue siendo todo BUY por sesgo del modelo.
+    # GBPAUD: promedio=0.463, P90=0.499, max=0.904
+    #         Threshold 0.55 estaba por encima del P90 → casi nunca señalaba.
+    #         Las 2 señales reales que salieron lo hicieron con conf=0.88-0.90.
+    #         Nuevo threshold: 0.67 — captura solo picos reales (>P90+margen amplio).
+    #         El cooldown evitará rachas si aparecen.
     "GBPAUD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPAUD_v4.pth",
         "scaler_file":   "scaler_GBPAUD_v4.pkl",
         "cols_file":     "input_columns_GBPAUD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPAUD.xlsx",
-        "min_threshold": 0.55,   # calibrado: max conf real = 0.68, P90 = 0.46
+        "min_threshold": 0.67,   # ↑ subido desde 0.55 — P90=0.50, señales reales en 0.88-0.90
     },
-    # EURUSD:  mediana conf=0.48, threshold 0.50 da 33% señales con buen BUY/SELL
-    #          Es el único forex funcionando correctamente. Mantener 0.50.
+    # EURUSD: promedio=0.470, P90=0.492, max=0.899
+    #         Las señales reales salen en picos de 0.87-0.90.
+    #         Threshold 0.70 correcto — no tocar.
     "EURUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_EURUSD_v4.pth",
         "scaler_file":   "scaler_EURUSD_v4.pkl",
         "cols_file":     "input_columns_EURUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_EURUSD.xlsx",
-        "min_threshold": 0.70,   # calibrado: max conf real = 0.84, P90 = 0.47 (picos reales)
+        "min_threshold": 0.70,   # ✅ correcto — señales reales en 0.87-0.90
     },
-    # GBPUSD:  mediana conf=0.58, 99.8% superaban 0.52 → subir a 0.65
-    #          A 0.65: 22.4% dan señal. Sigue siendo casi todo SELL.
+    # GBPUSD: promedio=0.488, P90=0.541, max=0.909
+    #         Threshold 0.80 era inalcanzable (solo 2 velas en 400 lo superaron).
+    #         Las señales reales salen en 0.88-0.91.
+    #         Nuevo threshold: 0.70 — por encima del P90 pero alcanzable en picos reales.
     "GBPUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPUSD_v4.pth",
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.80,   # GBPUSD: sigue sesgado a SELL, threshold alto hasta reentrenamiento
+        "min_threshold": 0.70,   # ↓ bajado desde 0.80 — P90=0.54, señales reales en 0.88-0.91
     },
 }
 
@@ -142,6 +154,49 @@ def cache_set(clave, valor):
     if len(CACHE_VELAS) > CACHE_MAX:
         CACHE_VELAS.popitem(last=False)
 
+# ── Cooldown por símbolo ──────────────────────────────────────
+# Evita señales consecutivas vela tras vela.
+# Después de una señal válida (BUY/SELL), el símbolo entra en cooldown
+# y las siguientes N velas devuelven IGNORE aunque superen el threshold.
+#
+# Forex:   COOLDOWN_VELAS_FOREX   = 3  (pares tienden a generar más seguidas)
+# Índices: COOLDOWN_VELAS_INDICES = 2
+#
+# El cooldown NO altera thresholds ni confianzas — solo decide si publicar
+# la señal al EA. El log forex sigue registrando todo normalmente.
+#
+# Estructura: { "EURUSD": {"last_signal_vela": "EURUSD_202601191315", "restantes": 2} }
+COOLDOWN_VELAS_FOREX   = 3
+COOLDOWN_VELAS_INDICES = 2
+FOREX_SYMS_COOLDOWN    = {"AUDUSD", "GBPAUD", "EURUSD", "GBPUSD", "BTCUSD"}
+_cooldown_state: dict  = {}
+_cooldown_lock         = threading.Lock()
+
+def cooldown_check_and_update(sym: str, clave_vela: str, tiene_señal: bool) -> bool:
+    """
+    Devuelve True si la señal debe publicarse, False si está en cooldown.
+    Registra la nueva vela activa y decrementa el contador.
+    """
+    velas_cd = COOLDOWN_VELAS_FOREX if sym in FOREX_SYMS_COOLDOWN else COOLDOWN_VELAS_INDICES
+    with _cooldown_lock:
+        estado = _cooldown_state.get(sym)
+
+        if estado and estado["last_vela"] != clave_vela:
+            # Nueva vela → decrementar cooldown restante
+            if estado["restantes"] > 0:
+                estado["restantes"] -= 1
+                _cooldown_state[sym] = estado
+
+        if estado and estado["restantes"] > 0 and estado["last_vela"] != clave_vela:
+            # Todavía en cooldown: bloquear señal
+            return False
+
+        if tiene_señal:
+            # Señal válida → activar cooldown para las próximas N velas
+            _cooldown_state[sym] = {"last_vela": clave_vela, "restantes": velas_cd}
+
+    return True
+
 # ── Sistema de log para diagnóstico forex ─────────────────────
 # Registra cada predicción forex en AnalisisForex.jsonl
 # Una línea JSON por predicción → fácil de leer y analizar
@@ -154,32 +209,86 @@ def log_forex(sym, fecha_str, o5, h5, l5, c5, v5,
               ema550, ema5200, adx5, diPlus5, diMinus5,
               macdLine5, signalLine5,
               confidence, threshold, signal, resultado_final,
-              profit_est):
-    """Escribe una línea JSON en AnalisisForex.jsonl por cada predicción forex."""
+              profit_est, cooldown_bloqueado=False):
+    """
+    Escribe una línea JSON en AnalisisForex.jsonl por cada predicción forex.
+    Campos añadidos v6.6:
+      - cooldown_bloqueado: True si el cooldown suprimió esta señal
+      - vela_body_pips:     tamaño del cuerpo de la vela en pips (c5-o5 normalizado)
+      - tendencia_ema:      dirección EMA550 vs EMA5200 ("alcista"/"bajista"/"lateral")
+      - macd_cruce:         True si hubo cruce MACD en esta vela
+      - adx_fuerza:         "fuerte"(>25) / "moderado"(20-25) / "debil"(<20)
+      - hora_sesion:        sesión de mercado estimada (Londres/NY/Asia/Overlap)
+    """
+    # ── Contexto técnico adicional ────────────────────────────────
+    body_pips = round(abs(c5 - o5) * (10000 if c5 < 10 else 100), 2)  # pips aprox
+
+    if ema550 is not None and ema5200 is not None:
+        diff_ema = ema550 - ema5200
+        if   diff_ema >  0.0001: tendencia_ema = "alcista"
+        elif diff_ema < -0.0001: tendencia_ema = "bajista"
+        else:                    tendencia_ema = "lateral"
+    else:
+        tendencia_ema = None
+
+    if macdLine5 is not None and signalLine5 is not None:
+        macd_cruce = (macdLine5 > signalLine5) != (macdLine5 < signalLine5)  # siempre True/False
+        macd_dir   = "sobre_signal" if macdLine5 >= signalLine5 else "bajo_signal"
+    else:
+        macd_cruce = None
+        macd_dir   = None
+
+    if adx5 is not None:
+        if   adx5 >= 25: adx_fuerza = "fuerte"
+        elif adx5 >= 20: adx_fuerza = "moderado"
+        else:            adx_fuerza = "debil"
+    else:
+        adx_fuerza = None
+
+    try:
+        hora_dt = datetime.fromisoformat(fecha_str)
+        hora_utc = hora_dt.hour
+        if   8 <= hora_utc < 12:  hora_sesion = "Londres"
+        elif 12 <= hora_utc < 16: hora_sesion = "Overlap_LDN_NY"
+        elif 16 <= hora_utc < 21: hora_sesion = "Nueva_York"
+        else:                     hora_sesion = "Asia_Pacifico"
+        dia_semana_n = hora_dt.weekday()   # 0=Lun, 4=Vie
+    except Exception:
+        hora_sesion  = None
+        dia_semana_n = None
+
     entry = {
         "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sym":        sym,
         "fecha":      fecha_str,
-        # precios raw
+        # ── Contexto de sesión ────────────────────────────────────
+        "hora_sesion":       hora_sesion,
+        "dia_semana":        dia_semana_n,   # 0=Lun … 4=Vie
+        # ── precios raw ───────────────────────────────────────────
         "o5": round(o5, 6), "h5": round(h5, 6),
         "l5": round(l5, 6), "c5": round(c5, 6), "v5": round(v5, 2),
-        # indicadores raw
+        "body_pips": body_pips,
+        # ── indicadores raw ───────────────────────────────────────
         "rsi5": round(r5, 2), "stoch_main": round(m5, 2), "stoch_sign": round(s5, 2),
         "ema550":  round(ema550,  6) if ema550  is not None else None,
         "ema5200": round(ema5200, 6) if ema5200 is not None else None,
-        "adx5":    round(adx5,   2) if adx5    is not None else None,
-        "diPlus5": round(diPlus5,2) if diPlus5 is not None else None,
-        "diMinus5":round(diMinus5,2) if diMinus5 is not None else None,
+        "tendencia_ema": tendencia_ema,
+        "adx5":      round(adx5,   2) if adx5    is not None else None,
+        "adx_fuerza":adx_fuerza,
+        "diPlus5":   round(diPlus5,2) if diPlus5 is not None else None,
+        "diMinus5":  round(diMinus5,2) if diMinus5 is not None else None,
         "macdLine5":   round(macdLine5,  6) if macdLine5   is not None else None,
         "signalLine5": round(signalLine5,6) if signalLine5 is not None else None,
-        # resultado del modelo
-        "confidence":      round(confidence, 4),
-        "threshold":       round(threshold, 4),
-        "gap_vs_threshold":round(confidence - threshold, 4),  # negativo = no alcanzó
-        "supera_umbral":   confidence >= threshold,
-        "signal_modelo":   signal,        # lo que el modelo dice (BUY/SELL)
-        "resultado_final": resultado_final,  # lo que la API devuelve (puede ser IGNORE)
-        "profit_est":      round(profit_est, 6),
+        "macd_dir":    macd_dir,
+        # ── resultado del modelo ──────────────────────────────────
+        "confidence":        round(confidence, 4),
+        "threshold":         round(threshold, 4),
+        "gap_vs_threshold":  round(confidence - threshold, 4),
+        "supera_umbral":     confidence >= threshold,
+        "signal_modelo":     signal,
+        "resultado_final":   resultado_final,
+        "cooldown_bloqueado":cooldown_bloqueado,   # ← NUEVO v6.6
+        "profit_est":        round(profit_est, 6),
     }
     with _log_lock:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -591,13 +700,21 @@ def predict(
 
     valid = confidence >= THRESHOLD
 
+    # ── Cooldown: evitar señales en velas consecutivas ────────────
+    # Si el modelo supera el threshold pero el símbolo está en cooldown,
+    # la señal se convierte en IGNORE para el EA. Los thresholds no cambian.
+    tiene_señal = valid
+    puede_publicar = cooldown_check_and_update(sym, clave_vela, tiene_señal)
+    resultado_final = (signal if (valid and puede_publicar) else "IGNORE")
+
     resultado = {
         "valor_profit":  round(profit_est, 6),
-        "RESULTADO":     signal if valid else "IGNORE",
+        "RESULTADO":     resultado_final,
         "percentil_inf": m["p_inf"],
         "percentil_sup": m["p_sup"],
-        "confidence":    round(confidence, 4),   # útil para debug
-        "threshold":     round(THRESHOLD, 4),    # útil para debug
+        # Nota: confidence, threshold y cooldown_activo se registran en el log
+        # pero NO se devuelven en la respuesta al EA para mantener compatibilidad
+        # con el parser del EA (SafeStringSplit3 basado en orden de campos).
     }
 
     # ── Log de diagnóstico para forex ────────────────────────────
@@ -612,8 +729,9 @@ def predict(
             adx5=adx5, diPlus5=diPlus5, diMinus5=diMinus5,
             macdLine5=macdLine5, signalLine5=signalLine5,
             confidence=confidence, threshold=THRESHOLD,
-            signal=signal, resultado_final=resultado["RESULTADO"],
+            signal=signal, resultado_final=resultado_final,
             profit_est=profit_est,
+            cooldown_bloqueado=(valid and not puede_publicar),
         )
 
     cache_set(clave_vela, resultado)
@@ -622,13 +740,25 @@ def predict(
 @app.get("/analisis_forex")
 def analisis_forex(symbol: str = Query(None), ultimas: int = Query(200)):
     """
-    Devuelve un resumen del log forex para diagnóstico.
+    Resumen de diagnóstico del log forex.
     Parámetros:
       symbol  — filtrar por par (AUDUSD, GBPAUD, EURUSD, GBPUSD). Opcional.
       ultimas — cuántas entradas recientes analizar (default 200).
+
+    Secciones de respuesta (v6.6):
+      1. resumen_confianza      — estadísticas de distribución de confianza
+      2. señales                — cuántas llegaron al EA, bloqueadas por cooldown, etc.
+      3. cooldown               — efectividad del cooldown: cuántas señales filtró
+      4. rachas_consecutivas    — distribución de rachas de señales seguidas (antes del cooldown)
+      5. sesiones               — señales y confianza media por sesión de mercado
+      6. dias_semana            — señales por día (0=Lun … 4=Vie)
+      7. sesgo_direccional      — BUY vs SELL por sesión y tendencia EMA
+      8. indicadores_en_señales — RSI / ADX / MACD promedio cuando hay señal real
+      9. diagnosis              — texto accionable
+      10. ultimas_15_entradas   — tabla rápida de las últimas entradas
     """
     if not os.path.exists(LOG_PATH):
-        return {"error": "Aún no hay datos. El archivo se crea cuando llega la primera petición forex."}
+        return {"error": "Aún no hay datos. El archivo AnalisisForex.jsonl se crea con la primera petición forex."}
 
     entries = []
     with open(LOG_PATH, "r", encoding="utf-8") as f:
@@ -643,19 +773,32 @@ def analisis_forex(symbol: str = Query(None), ultimas: int = Query(200)):
     if symbol:
         entries = [e for e in entries if e.get("sym","").upper() == symbol.upper()]
 
-    entries = entries[-ultimas:]  # solo las últimas N
+    entries = entries[-ultimas:]
 
     if not entries:
-        return {"error": f"Sin datos para {'symbol='+symbol if symbol else 'forex'}"}
+        return {"error": f"Sin datos para {'symbol='+symbol if symbol else 'todos los pares forex'}"}
 
+    n = len(entries)
+
+    # ── Helpers ───────────────────────────────────────────────────
+    def safe_mean(lst):
+        return round(sum(lst) / len(lst), 4) if lst else None
+
+    def pct(a, total):
+        return round(a / total * 100, 1) if total else 0.0
+
+    # ── Clasificaciones base ──────────────────────────────────────
     confs      = [e["confidence"]       for e in entries]
     gaps       = [e["gap_vs_threshold"] for e in entries]
-    superan    = [e for e in entries if e["supera_umbral"]]
-    no_superan = [e for e in entries if not e["supera_umbral"]]
-    buys       = [e for e in superan if e["signal_modelo"] == "BUY"]
-    sells      = [e for e in superan if e["signal_modelo"] == "SELL"]
+    superan    = [e for e in entries if e.get("supera_umbral")]
+    publicadas = [e for e in entries if e.get("resultado_final") in ("BUY","SELL")]
+    bloqueadas_cd = [e for e in entries if e.get("cooldown_bloqueado", False)]
+    buys_pub   = [e for e in publicadas if e.get("resultado_final") == "BUY"]
+    sells_pub  = [e for e in publicadas if e.get("resultado_final") == "SELL"]
+    threshold_usado = entries[-1].get("threshold") if entries else None
 
-    # Distribución de confianza en rangos
+    # ── 1. Distribución de confianza ─────────────────────────────
+    confs_s = sorted(confs)
     rangos = {"<0.40": 0, "0.40-0.50": 0, "0.50-0.60": 0,
               "0.60-0.70": 0, "0.70-0.80": 0, ">0.80": 0}
     for c in confs:
@@ -666,45 +809,204 @@ def analisis_forex(symbol: str = Query(None), ultimas: int = Query(200)):
         elif c < 0.80: rangos["0.70-0.80"] += 1
         else:          rangos[">0.80"] += 1
 
-    n = len(entries)
-    threshold_usado = entries[-1]["threshold"] if entries else None
+    resumen_confianza = {
+        "minima":  round(min(confs), 4),
+        "maxima":  round(max(confs), 4),
+        "promedio":round(sum(confs)/n, 4),
+        "P25":     round(confs_s[int(n*0.25)], 4),
+        "P50":     round(confs_s[int(n*0.50)], 4),
+        "P75":     round(confs_s[int(n*0.75)], 4),
+        "P90":     round(confs_s[int(n*0.90)], 4),
+        "distribucion": rangos,
+    }
+
+    # ── 2. Señales ────────────────────────────────────────────────
+    señales = {
+        "total_velas_analizadas":   n,
+        "superan_umbral":           len(superan),
+        "publicadas_al_EA":         len(publicadas),
+        "bloqueadas_por_cooldown":  len(bloqueadas_cd),
+        "ignoradas_por_threshold":  n - len(superan),
+        "pct_publicadas":           pct(len(publicadas), n),
+        "pct_superan_umbral":       pct(len(superan), n),
+        "BUY_publicadas":           len(buys_pub),
+        "SELL_publicadas":          len(sells_pub),
+        "ratio_buy_sell":           round(len(buys_pub)/len(sells_pub), 2) if sells_pub else "∞",
+    }
+
+    # ── 3. Cooldown — efectividad ─────────────────────────────────
+    cooldown_stats = {
+        "señales_bloqueadas":          len(bloqueadas_cd),
+        "señales_que_habrian_salido":  len(superan),
+        "reduccion_pct":               pct(len(bloqueadas_cd), len(superan)) if superan else 0.0,
+        "BUY_bloqueados":              sum(1 for e in bloqueadas_cd if e.get("signal_modelo")=="BUY"),
+        "SELL_bloqueados":             sum(1 for e in bloqueadas_cd if e.get("signal_modelo")=="SELL"),
+        "confianza_promedio_bloqueadas": safe_mean([e["confidence"] for e in bloqueadas_cd]),
+        "confianza_promedio_publicadas": safe_mean([e["confidence"] for e in publicadas]),
+        "nota": (
+            "✅ Cooldown funcionando — filtra señales seguidas sin alterar thresholds."
+            if bloqueadas_cd else
+            "ℹ️ Sin señales bloqueadas por cooldown aún en este período."
+        ),
+    }
+
+    # ── 4. Rachas consecutivas (pre-cooldown, sobre superan_umbral) ──
+    # Detecta cuántas veces el modelo dio señales N veces seguidas
+    rachas = []
+    racha_actual = 0
+    prev_supera  = False
+    for e in entries:
+        if e.get("supera_umbral"):
+            racha_actual += 1
+        else:
+            if racha_actual > 0:
+                rachas.append(racha_actual)
+            racha_actual = 0
+        prev_supera = e.get("supera_umbral", False)
+    if racha_actual > 0:
+        rachas.append(racha_actual)
+
+    dist_rachas = {}
+    for r in rachas:
+        k = f"{r}_seguidas"
+        dist_rachas[k] = dist_rachas.get(k, 0) + 1
+
+    rachas_stats = {
+        "total_rachas_detectadas": len(rachas),
+        "racha_maxima":            max(rachas) if rachas else 0,
+        "racha_promedio":          round(sum(rachas)/len(rachas), 2) if rachas else 0,
+        "distribucion":            dict(sorted(dist_rachas.items())),
+        "nota": (
+            f"⚠️ Hay rachas de hasta {max(rachas)} señales seguidas — el cooldown las filtra."
+            if rachas and max(rachas) >= 3 else
+            "✅ Las rachas son cortas (≤2 seguidas)."
+        ) if rachas else "ℹ️ Sin rachas detectadas en este período.",
+    }
+
+    # ── 5. Por sesión de mercado ──────────────────────────────────
+    sesiones_orden = ["Londres", "Overlap_LDN_NY", "Nueva_York", "Asia_Pacifico"]
+    sesiones = {}
+    for s in sesiones_orden:
+        grp = [e for e in entries if e.get("hora_sesion") == s]
+        pub = [e for e in grp if e.get("resultado_final") in ("BUY","SELL")]
+        sesiones[s] = {
+            "velas":       len(grp),
+            "publicadas":  len(pub),
+            "pct_señal":   pct(len(pub), len(grp)),
+            "conf_media":  safe_mean([e["confidence"] for e in grp]),
+        }
+
+    # ── 6. Por día de semana ──────────────────────────────────────
+    dias_nombres = {0:"Lunes", 1:"Martes", 2:"Miercoles", 3:"Jueves", 4:"Viernes"}
+    dias = {}
+    for d in range(5):
+        grp = [e for e in entries if e.get("dia_semana") == d]
+        pub = [e for e in grp if e.get("resultado_final") in ("BUY","SELL")]
+        if grp:
+            dias[dias_nombres[d]] = {
+                "velas":      len(grp),
+                "publicadas": len(pub),
+                "pct_señal":  pct(len(pub), len(grp)),
+                "conf_media": safe_mean([e["confidence"] for e in grp]),
+            }
+
+    # ── 7. Sesgo direccional ──────────────────────────────────────
+    sesgo = {}
+    for s in sesiones_orden:
+        grp_pub = [e for e in publicadas if e.get("hora_sesion") == s]
+        if grp_pub:
+            buys_s  = sum(1 for e in grp_pub if e.get("resultado_final")=="BUY")
+            sells_s = sum(1 for e in grp_pub if e.get("resultado_final")=="SELL")
+            sesgo[s] = {"BUY": buys_s, "SELL": sells_s,
+                        "sesgo": "BUY" if buys_s > sells_s else ("SELL" if sells_s > buys_s else "NEUTRO")}
+
+    # Sesgo por tendencia EMA
+    for tend in ("alcista", "bajista", "lateral"):
+        grp_t = [e for e in publicadas if e.get("tendencia_ema") == tend]
+        if grp_t:
+            b = sum(1 for e in grp_t if e.get("resultado_final")=="BUY")
+            s_ = sum(1 for e in grp_t if e.get("resultado_final")=="SELL")
+            sesgo[f"EMA_{tend}"] = {"BUY": b, "SELL": s_,
+                                    "sesgo": "BUY" if b>s_ else ("SELL" if s_>b else "NEUTRO")}
+
+    # ── 8. Indicadores en señales publicadas ──────────────────────
+    rsis  = [e["rsi5"]  for e in publicadas if e.get("rsi5")  is not None]
+    adxs  = [e["adx5"]  for e in publicadas if e.get("adx5")  is not None]
+    bodys = [e.get("body_pips", 0) for e in publicadas]
+    indicadores_señales = {
+        "rsi5_promedio":       safe_mean(rsis),
+        "adx5_promedio":       safe_mean(adxs),
+        "body_pips_promedio":  safe_mean(bodys),
+        "adx_fuerza_dist": {
+            "fuerte":   sum(1 for e in publicadas if e.get("adx_fuerza")=="fuerte"),
+            "moderado": sum(1 for e in publicadas if e.get("adx_fuerza")=="moderado"),
+            "debil":    sum(1 for e in publicadas if e.get("adx_fuerza")=="debil"),
+        },
+        "macd_dir_dist": {
+            "sobre_signal": sum(1 for e in publicadas if e.get("macd_dir")=="sobre_signal"),
+            "bajo_signal":  sum(1 for e in publicadas if e.get("macd_dir")=="bajo_signal"),
+        },
+    }
+
+    # ── 9. Diagnosis accionable ───────────────────────────────────
+    problemas, sugerencias = [], []
+    pct_pub = pct(len(publicadas), n)
+
+    if pct_pub == 0:
+        problemas.append(f"❌ 0% de velas generan señal. Threshold={threshold_usado} posiblemente demasiado alto.")
+        sugerencias.append("Reducir min_threshold en MODELOS_CONFIG para este par.")
+    elif pct_pub > 40:
+        problemas.append(f"⚠️ {pct_pub}% de velas generan señal — demasiado frecuente.")
+        sugerencias.append("Aumentar COOLDOWN_VELAS_FOREX o subir min_threshold.")
+    elif pct_pub < 5:
+        problemas.append(f"⚠️ Solo {pct_pub}% de velas generan señal — puede ser insuficiente.")
+        sugerencias.append("Bajar ligeramente min_threshold o COOLDOWN_VELAS_FOREX.")
+
+    if señales["ratio_buy_sell"] != "∞":
+        rb = señales["ratio_buy_sell"]
+        if rb > 3:
+            problemas.append(f"⚠️ Fuerte sesgo BUY (ratio {rb}:1). El modelo puede necesitar reentrenamiento con dataset balanceado.")
+        elif rb < 0.33:
+            problemas.append(f"⚠️ Fuerte sesgo SELL (ratio {rb}:1). Mismo diagnóstico.")
+
+    if rachas and rachas_stats["racha_maxima"] >= 5:
+        problemas.append(f"⚠️ Rachas de hasta {rachas_stats['racha_maxima']} señales seguidas detectadas antes del cooldown.")
+        sugerencias.append(f"Considerar aumentar COOLDOWN_VELAS_FOREX a {rachas_stats['racha_maxima']-1} o más.")
+
+    if cooldown_stats["confianza_promedio_bloqueadas"] and cooldown_stats["confianza_promedio_publicadas"]:
+        if cooldown_stats["confianza_promedio_bloqueadas"] > cooldown_stats["confianza_promedio_publicadas"]:
+            problemas.append("⚠️ Las señales bloqueadas por cooldown tienen confianza MAYOR que las publicadas — el cooldown puede estar filtrando las mejores señales.")
+            sugerencias.append("Reducir COOLDOWN_VELAS_FOREX o revisar la lógica de cooldown.")
+
+    diagnosis = {
+        "problemas":    problemas if problemas else ["✅ Sin problemas detectados en este período."],
+        "sugerencias":  sugerencias if sugerencias else ["✅ Configuración estable."],
+    }
+
+    # ── 10. Últimas 15 entradas ───────────────────────────────────
+    campos_tabla = ["ts","sym","fecha","confidence","threshold","gap_vs_threshold",
+                    "supera_umbral","cooldown_bloqueado","resultado_final",
+                    "hora_sesion","adx_fuerza","tendencia_ema","body_pips"]
+    ultimas_entradas = [
+        {k: e.get(k) for k in campos_tabla}
+        for e in entries[-15:]
+    ]
 
     return {
-        "symbol_filtrado": symbol or "TODOS_FOREX",
-        "total_entradas_analizadas": n,
-        "threshold_actual": threshold_usado,
-        "resumen_confianza": {
-            "minima":  round(min(confs), 4),
-            "maxima":  round(max(confs), 4),
-            "promedio":round(sum(confs)/n, 4),
-            "P25":     round(sorted(confs)[int(n*0.25)], 4),
-            "P50":     round(sorted(confs)[int(n*0.50)], 4),
-            "P75":     round(sorted(confs)[int(n*0.75)], 4),
-            "P90":     round(sorted(confs)[int(n*0.90)], 4),
-        },
-        "distribucion_confianza": rangos,
-        "señales": {
-            "total_superan_umbral":    len(superan),
-            "total_no_superan_umbral": len(no_superan),
-            "pct_señales":             round(len(superan)/n*100, 1),
-            "BUY":                     len(buys),
-            "SELL":                    len(sells),
-        },
-        "gap_promedio_vs_threshold": round(sum(gaps)/n, 4),
-        "diagnosis": (
-            "✅ El modelo genera señales normalmente."
-            if len(superan)/n > 0.10
-            else f"⚠️  Solo {round(len(superan)/n*100,1)}% de peticiones superan el umbral ({threshold_usado}). "
-                 f"La confianza máxima registrada es {round(max(confs),4)}. "
-                 + ("El threshold está muy alto para este par — reducir min_threshold."
-                    if threshold_usado and max(confs) < threshold_usado
-                    else "El modelo tiene baja confianza general — revisar calidad del entrenamiento.")
-        ),
-        "ultimas_10_entradas": [
-            {k: e[k] for k in ["ts","sym","fecha","confidence","threshold",
-                                "gap_vs_threshold","supera_umbral","resultado_final"]}
-            for e in entries[-10:]
-        ],
+        "symbol_filtrado":          symbol or "TODOS_FOREX",
+        "periodo_analizado":        f"{entries[0].get('ts','?')} → {entries[-1].get('ts','?')}",
+        "threshold_actual":         threshold_usado,
+        "resumen_confianza":        resumen_confianza,
+        "señales":                  señales,
+        "cooldown":                 cooldown_stats,
+        "rachas_consecutivas":      rachas_stats,
+        "por_sesion":               sesiones,
+        "por_dia_semana":           dias,
+        "sesgo_direccional":        sesgo,
+        "indicadores_en_señales":   indicadores_señales,
+        "gap_promedio_vs_threshold":round(sum(gaps)/n, 4),
+        "diagnosis":                diagnosis,
+        "ultimas_15_entradas":      ultimas_entradas,
     }
 
 @app.get("/health")

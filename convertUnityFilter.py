@@ -8,7 +8,7 @@ BASE_PATH = r"C:\Users\user\OneDrive\Documentos\Trading\ModelPrPth\apiPrPthDatas
 CONVERTED_PATH = os.path.join(BASE_PATH, "TrasnformerTxConvertidos")
 os.makedirs(CONVERTED_PATH, exist_ok=True)
 
-symbol = "EURUSD"
+symbol = "GER40"
  
 TRANSFORMER_FILE = glob.glob(os.path.join(DOWNLOADS_PATH, f"transformer_{symbol}_*.csv"))
 TX_FILE = glob.glob(os.path.join(DOWNLOADS_PATH, f"TX_{symbol}_*.csv"))

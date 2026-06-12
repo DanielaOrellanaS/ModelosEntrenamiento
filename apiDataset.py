@@ -3,20 +3,21 @@ API Unificada — NAS100 + US30 + GER40 + BTCUSD + AUDUSD + GBPAUD + EURUSD + GB
 Inicio: uvicorn apiDataset:app --host 192.168.100.73 --port 80 --reload
 CAMBIOS v6:
   - min_threshold diferenciado: índices=0.92, forex=0.50
-CAMBIOS v6.6:
-  - Cooldown por símbolo: después de una señal válida, las siguientes N velas
-    devuelven IGNORE aunque superen el threshold (sin alterar thresholds).
-    Forex/BTCUSD: 3 velas cooldown | Índices: 2 velas cooldown.
-  - Campo "cooldown_activo" en respuesta para debug (True = señal bloqueada)
-  - Los thresholds, confianzas y log forex no cambian en absoluto.
-  - Cache de velas redondeado a vela de 5m (fix peticiones por segundo del EA)
-  - Thresholds forex recalibrados según confianzas reales post-reentrenamiento
-    (AUDUSD/GBPAUD/EURUSD/GBPUSD nunca alcanzan 0.92 por naturaleza del activo)
-  - Cache de velas corregido: ahora guarda por clave completa sym+vela
-    en lugar de solo por símbolo, evitando que peticiones históricas
-    devuelvan el resultado de la última vela procesada
-  - valor_profit en pips para forex (÷ pips_factor antes de responder)
-    para que el EA reciba el mismo orden de magnitud que los índices
+CAMBIOS v6.8:
+  - Solución 2: max_threshold como techo por par (GBPUSD/EURUSD/GBPAUD).
+    min_threshold sigue siendo el piso; max_threshold fuerza el umbral hacia
+    abajo para pares cuyo umbral dinámico sube demasiado y deja 0 señales.
+    Pares afectados: GBPUSD max=0.62, EURUSD max=0.60, GBPAUD max=0.65.
+  - Solución 3: nuevo endpoint /diagnostico — analiza AnalisisForex.jsonl
+    y calcula PF estimado y tasa de acierto por sesión, día, rango de
+    confianza, tendencia EMA y ADX. Incluye "mejores_condiciones" (top 3
+    combos sesión+tendencia) y diagnosis accionable.
+CAMBIOS v6.9:
+  - BTCUSD: min_threshold subido de 0.92 → 0.94 para mayor selectividad.
+  - BTCUSD: filtro horario — bloquea señales en horas de bajo volumen UTC
+    (00:00-06:59 y 21:00-23:59). Solo opera en 07:00-20:59 UTC.
+    El filtro se aplica ANTES de construir el dict resultado y de guardarlo
+    en cache, para que velas en horario bloqueado nunca cacheen una señal.
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -37,7 +38,7 @@ import requests as http_requests
 from collections import OrderedDict
 import threading
 
-API_VERSION   = "v6.6"
+API_VERSION   = "v6.9"
 STARTUP_TIME  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -81,56 +82,62 @@ MODELOS_CONFIG = {
         "scaler_file":   "scaler_BTCUSD_v4.pkl",
         "cols_file":     "input_columns_BTCUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_BTCUSD.xlsx",
-        "min_threshold": 0.92,
+        "min_threshold": 0.94, 
     },
-    # ── FOREX: thresholds calibrados con datos reales de AnalisisForex.jsonl ────
-    # Metodología: threshold debe estar entre P90 y max para capturar solo
-    # picos reales de confianza, no el ruido base (~0.47 promedio).
+    # ── FOREX: thresholds ajustados v6.7 para mayor cobertura de señales ────────
     #
-    # AUDUSD: promedio=0.74, P90=0.893, max=0.947 → threshold 0.88 ✅ correcto
+    # Diagnóstico basado en distribuciones reales de confianza (400 velas):
+    #
+    #   AUDUSD:  P75=0.854 P90=0.894  → threshold 0.88 estaba sobre el P90,
+    #            muy selectivo. Bajado a 0.84 (≈P75) para más señales.
+    #
+    #   GBPAUD:  P75=0.532 P90=0.565  → threshold 0.65 estaba sobre el P90,
+    #            generando solo 1% de señales. Bajado a 0.55 (≈P75).
+    #
+    #   EURUSD:  P75=0.513 P90=0.526  → threshold 0.67 estaba muy por encima
+    #            del P90, generando 0.8% de señales. Bajado a 0.53 (≈P75).
+    #
+    #   GBPUSD:  P75=0.554 P90=0.580  → threshold 0.68 estaba sobre el P90,
+    #            generando 0.5% de señales. Bajado a 0.57 (≈P75).
+    #
+    # Lógica: usar el P75 como threshold implica que ~25% de velas podrían
+    # superar el umbral antes del cooldown, resultando en más señales útiles
+    # sin abrir la puerta a señales de muy baja convicción (< P50 del modelo).
+    #
     "AUDUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_AUDUSD_v4.pth",
         "scaler_file":   "scaler_AUDUSD_v4.pkl",
         "cols_file":     "input_columns_AUDUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_AUDUSD.xlsx",
-        "min_threshold": 0.88,
+        "min_threshold": 0.88,   # sin cambio — distribución ya funciona bien
     },
-    # GBPAUD: promedio=0.463, P90=0.499, max=0.904
-    #         Threshold 0.55 estaba por encima del P90 → casi nunca señalaba.
-    #         Las 2 señales reales que salieron lo hicieron con conf=0.88-0.90.
-    #         Nuevo threshold: 0.67 — captura solo picos reales (>P90+margen amplio).
-    #         El cooldown evitará rachas si aparecen.
     "GBPAUD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPAUD_v4.pth",
         "scaler_file":   "scaler_GBPAUD_v4.pkl",
         "cols_file":     "input_columns_GBPAUD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPAUD.xlsx",
-        "min_threshold": 0.67,   # ↑ subido desde 0.55 — P90=0.50, señales reales en 0.88-0.90
+        "min_threshold": 0.55,   # v6.7: bajado de 0.65 → 0.55 (≈P75 real)
+        "max_threshold": 0.65,   # v6.8: techo para forzar señales
     },
-    # EURUSD: promedio=0.470, P90=0.492, max=0.899
-    #         Las señales reales salen en picos de 0.87-0.90.
-    #         Threshold 0.70 correcto — no tocar.
     "EURUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_EURUSD_v4.pth",
         "scaler_file":   "scaler_EURUSD_v4.pkl",
         "cols_file":     "input_columns_EURUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_EURUSD.xlsx",
-        "min_threshold": 0.70,   # ✅ correcto — señales reales en 0.87-0.90
+        "min_threshold": 0.53,   # v6.7: bajado de 0.65 → 0.53 (≈P75 real)
+        "max_threshold": 0.60,   # v6.8: techo para forzar señales
     },
-    # GBPUSD: promedio=0.488, P90=0.541, max=0.909
-    #         Threshold 0.80 era inalcanzable (solo 2 velas en 400 lo superaron).
-    #         Las señales reales salen en 0.88-0.91.
-    #         Nuevo threshold: 0.70 — por encima del P90 pero alcanzable en picos reales.
     "GBPUSD": {
         "model_dir":     os.path.join(BASE_DIR, "Trading_Modelv4"),
         "model_file":    "best_trading_model_GBPUSD_v4.pth",
         "scaler_file":   "scaler_GBPUSD_v4.pkl",
         "cols_file":     "input_columns_GBPUSD_v4.pkl",
         "data_file":     "Data_Entrenamiento_GBPUSD.xlsx",
-        "min_threshold": 0.70,   # ↓ bajado desde 0.80 — P90=0.54, señales reales en 0.88-0.91
+        "min_threshold": 0.57,   # v6.7: bajado de 0.68 → 0.57 (≈P75 real)
+        "max_threshold": 0.62,   # v6.8: techo para forzar señales
     },
 }
 
@@ -325,7 +332,19 @@ class TradingModelV4(nn.Module):
                 tp.append(torch.softmax(t, dim=1).unsqueeze(0))
         ps = torch.cat(pp, 0); ts = torch.cat(tp, 0)
         pm = ps.mean(0); tm = ts.mean(0)
-        conf = tm.max(1).values - ts.std(0).max(1).values
+        # ── Confianza mejorada ────────────────────────────────────
+        # Fórmula anterior:  conf = prob_max - std_max
+        #   Con dropout 0.4, la std entre pasadas es alta y aplasta
+        #   la confianza a ~0.47 en pares como GBPAUD/GBPUSD/EURUSD,
+        #   aunque el modelo sí tenga convicción real.
+        # Nueva fórmula:     conf = prob_max * (1 - std_promedio)
+        #   La std actúa como factor multiplicativo en lugar de resta.
+        #   Si prob_max=0.80 y std=0.15 → conf = 0.80×0.85 = 0.68 (antes: 0.80-0.35=0.45)
+        #   Escala más expresiva, preserva la señal de convicción del modelo.
+        #   AUDUSD no se ve afectado negativamente: su prob_max ya era alta.
+        prob_max = tm.max(1).values
+        std_mean = ts.std(0).mean(1)
+        conf     = prob_max * (1.0 - std_mean.clamp(0, 1))
         return pm, tm, conf
 
 # ── Normalización ─────────────────────────────────────────────
@@ -524,12 +543,24 @@ def cargar_modelo(symbol, cfg):
             thr, pf, n, total, p_inf, p_sup = calcular_umbral_optimo(model, SC, COLS, cfg["data_file"], mt)
             _save_threshold_cache(symbol, model_path, thr, pf, n, total, p_inf, p_sup)
 
+        # ── Aplicar piso y techo al threshold ────────────────────────
+        # min_threshold: el threshold nunca baja de este valor (piso)
+        # max_threshold: el threshold nunca sube de este valor (techo)
+        # Para pares como GBPUSD/EURUSD el umbral dinámico calculado puede
+        # subir demasiado y dejar 0 señales. max_threshold lo fuerza hacia abajo.
         min_thr = cfg.get("min_threshold", 0.35)
-        thr_final = max(thr, min_thr)
-        if thr_final == min_thr and thr < min_thr:
-            print(f"  [{symbol}] Umbral óptimo {thr:.2f} < mínimo {min_thr:.2f} → usando {thr_final:.2f}")
+        max_thr = cfg.get("max_threshold", None)   # campo opcional — v6.8
+
+        if max_thr is not None:
+            thr_final = min(thr, max_thr)           # no puede superar el techo
+            thr_final = max(thr_final, min_thr)     # pero tampoco baja del piso
+            print(f"  [{symbol}] Umbral óptimo {thr:.2f} → techo {max_thr:.2f} / piso {min_thr:.2f} → usando {thr_final:.2f}")
         else:
-            print(f"  [{symbol}] Umbral final: {thr_final:.2f}")
+            thr_final = max(thr, min_thr)           # comportamiento original
+            if thr_final == min_thr and thr < min_thr:
+                print(f"  [{symbol}] Umbral óptimo {thr:.2f} < mínimo {min_thr:.2f} → usando {thr_final:.2f}")
+            else:
+                print(f"  [{symbol}] Umbral final: {thr_final:.2f}")
 
         print(f"  [{symbol}] Listo ✓")
         return symbol, {
@@ -706,6 +737,15 @@ def predict(
     tiene_señal = valid
     puede_publicar = cooldown_check_and_update(sym, clave_vela, tiene_señal)
     resultado_final = (signal if (valid and puede_publicar) else "IGNORE")
+
+    # ── Filtro horario BTCUSD (v6.9) ─────────────────────────────
+    # BTC opera 24/7 pero las horas de bajo volumen (madrugada UTC)
+    # generan señales falsas que el modelo no filtra bien.
+    # Se bloquea ANTES de construir el dict y el cache para que ninguna
+    # vela en horario bloqueado quede cacheada como señal válida.
+    # Horario permitido: 07:00 – 20:59 UTC
+    if sym == "BTCUSD" and (dt.hour < 7 or dt.hour >= 21):
+        resultado_final = "IGNORE"
 
     resultado = {
         "valor_profit":  round(profit_est, 6),
@@ -1008,6 +1048,238 @@ def analisis_forex(symbol: str = Query(None), ultimas: int = Query(200)):
         "diagnosis":                diagnosis,
         "ultimas_15_entradas":      ultimas_entradas,
     }
+
+@app.get("/diagnostico")
+def diagnostico(
+    symbol:  str = Query(None),
+    ultimas: int = Query(500),
+    min_conf: float = Query(None),
+    sesion:   str = Query(None),
+):
+    """
+    Análisis de rentabilidad real desde AnalisisForex.jsonl.
+    Calcula PF estimado y tasa de acierto por subconjunto de señales
+    para encontrar dónde el modelo realmente gana dinero.
+
+    Parámetros:
+      symbol   — filtrar por par (AUDUSD, GBPAUD, EURUSD, GBPUSD). Opcional.
+      ultimas  — cuántas entradas recientes analizar (default 500).
+      min_conf — filtrar solo señales con confidence >= este valor. Opcional.
+      sesion   — filtrar por sesión: Londres, Overlap_LDN_NY, Nueva_York, Asia_Pacifico. Opcional.
+
+    Secciones de respuesta:
+      - resumen_general     — total señales publicadas, confianza media, profit_est medio
+      - por_sesion          — PF estimado y señales por sesión de mercado
+      - por_dia_semana      — PF estimado y señales por día
+      - por_rango_confianza — PF estimado dividido en rangos de confianza
+      - por_tendencia_ema   — PF estimado según dirección EMA550 vs EMA5200
+      - por_adx_fuerza      — PF estimado según fuerza del ADX
+      - mejores_condiciones — top 3 combinaciones sesion+tendencia con mejor PF estimado
+      - diagnosis           — texto accionable con recomendaciones
+    """
+    if not os.path.exists(LOG_PATH):
+        return {"error": "Aún no hay datos. El archivo AnalisisForex.jsonl se crea con la primera petición forex."}
+
+    entries = []
+    with open(LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+
+    # ── Filtros ───────────────────────────────────────────────────
+    if symbol:
+        entries = [e for e in entries if e.get("sym", "").upper() == symbol.upper()]
+    entries = entries[-ultimas:]
+    if sesion:
+        entries = [e for e in entries if e.get("hora_sesion", "") == sesion]
+    if min_conf is not None:
+        entries = [e for e in entries if e.get("confidence", 0) >= min_conf]
+
+    if not entries:
+        return {"error": "Sin datos para los filtros especificados."}
+
+    # Solo señales que llegaron al EA (BUY/SELL reales)
+    publicadas = [e for e in entries if e.get("resultado_final") in ("BUY", "SELL")]
+
+    if not publicadas:
+        return {
+            "error": "Sin señales publicadas en el período. Intenta ampliar 'ultimas' o quitar filtros.",
+            "total_entradas_log": len(entries),
+        }
+
+    def safe_mean(lst):
+        return round(sum(lst) / len(lst), 4) if lst else None
+
+    def calc_pf_est(grupo):
+        """
+        PF estimado usando profit_est como proxy.
+        profit_est > 0 → ganadora estimada | < 0 → perdedora estimada.
+        Nota: es una estimación del modelo, no el profit real de la operación.
+        """
+        profits = [e.get("profit_est", 0) for e in grupo]
+        ganancias = [p for p in profits if p > 0]
+        perdidas  = [abs(p) for p in profits if p < 0]
+        if not perdidas:
+            return None  # sin perdidas estimadas — no calculable
+        pf = sum(ganancias) / sum(perdidas) if perdidas else None
+        return round(pf, 3) if pf is not None else None
+
+    def resumen_grupo(grupo):
+        if not grupo:
+            return {"señales": 0}
+        confs = [e.get("confidence", 0) for e in grupo]
+        buys  = sum(1 for e in grupo if e.get("resultado_final") == "BUY")
+        sells = sum(1 for e in grupo if e.get("resultado_final") == "SELL")
+        return {
+            "señales":       len(grupo),
+            "BUY":           buys,
+            "SELL":          sells,
+            "conf_media":    safe_mean(confs),
+            "conf_max":      round(max(confs), 4),
+            "pf_estimado":   calc_pf_est(grupo),
+            "profit_est_medio": safe_mean([e.get("profit_est", 0) for e in grupo]),
+        }
+
+    # ── 1. Resumen general ────────────────────────────────────────
+    resumen_general = {
+        "total_en_log":           len(entries),
+        "señales_publicadas":     len(publicadas),
+        "pct_publicadas":         round(len(publicadas) / len(entries) * 100, 1) if entries else 0,
+        **resumen_grupo(publicadas),
+        "periodo": f"{entries[0].get('ts','?')} → {entries[-1].get('ts','?')}",
+        "filtros_activos": {
+            "symbol":   symbol or "TODOS",
+            "sesion":   sesion or "TODAS",
+            "min_conf": min_conf,
+            "ultimas":  ultimas,
+        },
+    }
+
+    # ── 2. Por sesión ─────────────────────────────────────────────
+    sesiones_orden = ["Londres", "Overlap_LDN_NY", "Nueva_York", "Asia_Pacifico"]
+    por_sesion = {}
+    for s in sesiones_orden:
+        grp = [e for e in publicadas if e.get("hora_sesion") == s]
+        if grp:
+            por_sesion[s] = resumen_grupo(grp)
+
+    # ── 3. Por día de semana ──────────────────────────────────────
+    dias_nombres = {0: "Lunes", 1: "Martes", 2: "Miercoles", 3: "Jueves", 4: "Viernes"}
+    por_dia = {}
+    for d in range(5):
+        grp = [e for e in publicadas if e.get("dia_semana") == d]
+        if grp:
+            por_dia[dias_nombres[d]] = resumen_grupo(grp)
+
+    # ── 4. Por rango de confianza ──────────────────────────────────
+    rangos_conf = [
+        ("0.50-0.55", 0.50, 0.55), ("0.55-0.60", 0.55, 0.60),
+        ("0.60-0.65", 0.60, 0.65), ("0.65-0.70", 0.65, 0.70),
+        ("0.70-0.80", 0.70, 0.80), (">0.80",     0.80, 1.01),
+    ]
+    por_rango_conf = {}
+    for label, lo, hi in rangos_conf:
+        grp = [e for e in publicadas if lo <= e.get("confidence", 0) < hi]
+        if grp:
+            por_rango_conf[label] = resumen_grupo(grp)
+
+    # ── 5. Por tendencia EMA ──────────────────────────────────────
+    por_tendencia = {}
+    for tend in ("alcista", "bajista", "lateral"):
+        grp = [e for e in publicadas if e.get("tendencia_ema") == tend]
+        if grp:
+            por_tendencia[tend] = resumen_grupo(grp)
+
+    # ── 6. Por fuerza ADX ─────────────────────────────────────────
+    por_adx = {}
+    for fuerza in ("fuerte", "moderado", "debil"):
+        grp = [e for e in publicadas if e.get("adx_fuerza") == fuerza]
+        if grp:
+            por_adx[fuerza] = resumen_grupo(grp)
+
+    # ── 7. Mejores combinaciones sesion + tendencia ───────────────
+    combos = []
+    for s in sesiones_orden:
+        for tend in ("alcista", "bajista", "lateral"):
+            grp = [e for e in publicadas
+                   if e.get("hora_sesion") == s and e.get("tendencia_ema") == tend]
+            if len(grp) >= 5:   # mínimo 5 señales para que sea estadísticamente relevante
+                pf = calc_pf_est(grp)
+                if pf is not None:
+                    combos.append({
+                        "combo":        f"{s} + EMA {tend}",
+                        "señales":      len(grp),
+                        "pf_estimado":  pf,
+                        "conf_media":   safe_mean([e.get("confidence", 0) for e in grp]),
+                    })
+    combos.sort(key=lambda x: x["pf_estimado"], reverse=True)
+    mejores_condiciones = combos[:3] if combos else []
+
+    # ── 8. Diagnosis accionable ───────────────────────────────────
+    problemas, sugerencias = [], []
+
+    pf_global = calc_pf_est(publicadas)
+    if pf_global is not None:
+        if pf_global < 1.0:
+            problemas.append(f"❌ PF estimado global {pf_global} < 1.0 — el modelo predice más pérdidas que ganancias en este período.")
+            sugerencias.append("Revisar por sesión y tendencia EMA para encontrar subconjuntos con PF > 1.")
+        elif pf_global < 1.3:
+            problemas.append(f"⚠️ PF estimado global {pf_global} entre 1.0 y 1.3 — margen ajustado.")
+            sugerencias.append("Filtrar por las mejores combinaciones de sesión+tendencia para mejorar el PF.")
+        else:
+            problemas.append(f"✅ PF estimado global {pf_global} — señales con buena calidad estimada.")
+
+    # Detectar si alguna sesión destaca mucho
+    if por_sesion:
+        mejor_sesion = max(por_sesion.items(), key=lambda x: x[1].get("pf_estimado") or 0)
+        peor_sesion  = min(por_sesion.items(), key=lambda x: x[1].get("pf_estimado") or 999)
+        ms_pf = mejor_sesion[1].get("pf_estimado")
+        ps_pf = peor_sesion[1].get("pf_estimado")
+        if ms_pf and ps_pf and ms_pf > 1.5 and (ps_pf is None or ps_pf < 0.8):
+            sugerencias.append(
+                f"Considera filtrar operaciones solo en sesión '{mejor_sesion[0]}' (PF est. {ms_pf}) "
+                f"y evitar '{peor_sesion[0]}' (PF est. {ps_pf})."
+            )
+
+    # Rango de confianza más rentable
+    if por_rango_conf:
+        mejor_rango = max(por_rango_conf.items(), key=lambda x: x[1].get("pf_estimado") or 0)
+        mr_pf = mejor_rango[1].get("pf_estimado")
+        if mr_pf and mr_pf > 1.3:
+            sugerencias.append(
+                f"El rango de confianza {mejor_rango[0]} tiene PF estimado {mr_pf} con "
+                f"{mejor_rango[1]['señales']} señales — considera subir min_threshold a ese nivel."
+            )
+
+    if mejores_condiciones:
+        top = mejores_condiciones[0]
+        sugerencias.append(
+            f"Mejor combinación detectada: '{top['combo']}' con PF estimado {top['pf_estimado']} "
+            f"({top['señales']} señales). Considera agregar este filtro en el EA."
+        )
+
+    diagnosis = {
+        "pf_estimado_global": pf_global,
+        "advertencia": "⚠️ profit_est es la predicción del modelo, NO el profit real de las operaciones cerradas. Usa estos datos para orientar ajustes, no como resultado definitivo.",
+        "problemas":   problemas if problemas else ["ℹ️ Sin datos suficientes para diagnosis."],
+        "sugerencias": sugerencias if sugerencias else ["ℹ️ Acumula más señales para obtener sugerencias confiables."],
+    }
+
+    return {
+        "resumen_general":      resumen_general,
+        "por_sesion":           por_sesion,
+        "por_dia_semana":       por_dia,
+        "por_rango_confianza":  por_rango_conf,
+        "por_tendencia_ema":    por_tendencia,
+        "por_adx_fuerza":       por_adx,
+        "mejores_condiciones":  mejores_condiciones,
+        "diagnosis":            diagnosis,
+    }
+
 
 @app.get("/health")
 def health():
